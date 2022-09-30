@@ -60,17 +60,142 @@ namespace midikraft {
 		}
 	}
 
-	void SafeMidiOutput::sendBlockOfMessagesThrottled(const std::vector<MidiMessage>& buffer, int millisecondsWait) {
-		//TODO - this blocks the UI thread, but I don't want any logic to continue right now here.
-		if (midiOut_) {
-			for (const auto& message : buffer) {
-				if (MidiHelpers::isEmptySysex(message)) continue;
-				Thread::sleep(millisecondsWait);
-				midiOut_->sendMessageNow(message);
-				controller_->logMidiMessage(message, midiOut_->getName(), true);
+	std::future<void> SafeMidiOutput::sendBlockOfMessagesThrottled(const std::vector<MidiMessage>& buffer, int millisecondsWait) {
+		std::promise<void> promise;
+		std::future<void> future = promise.get_future();
+		if (buffer.size() < 2) {
+			sendBlockOfMessagesFullSpeed(buffer);
+			promise.set_value();
+		} else if (!midiOut_) {
+			promise.set_value();
+		} else {
+			queue_.push_job([this, buffer, millisecondsWait, promise = std::make_shared<std::promise<void>>(std::move(promise))] {
+				std::size_t current = 0, last = buffer.size() - 1;
+				token_.clean();
+				for (const auto& message : buffer) {
+					if (MidiHelpers::isEmptySysex(message))
+						continue;
+					token_.dirty();
+					midiOut_->sendMessageNow(message);
+					controller_->logMidiMessage(message, midiOut_->getName(), true);
+					if (current == last)
+						break;
+					if (token_.wait_while_dirty(std::chrono::milliseconds{millisecondsWait}) == details::TaskToken::Status::Done)
+						break;
+					++current;
+				}
+				token_.done();
+				promise->set_value();
+			});
+		}
+		return future;
+	}
+
+	std::future<void> SafeMidiOutput::sendBlockOfMessagesThrottled(const std::vector<MidiMessage>& buffer) {
+		return sendBlockOfMessagesThrottled(buffer, 30000); // Use an arbitrarily long timeout
+	}
+
+	void SafeMidiOutput::releaseCurrentThrottledMessagesBlock() {
+		token_.clean();
+	}
+
+	void SafeMidiOutput::cancelCurrentThrottledMessagesBlock() {
+		token_.done();
+	}
+
+	namespace details {
+
+		TaskQueue::TaskQueue() : thrd_([this] { run(); }) {
+		}
+
+		TaskQueue::~TaskQueue() {
+			done();
+			wait();
+		}
+
+		void TaskQueue::run() {
+			for (auto job = pop_job(); job; job = pop_job()) {
+				job();
 			}
 		}
-	}
+
+		void TaskQueue::push_job(std::function<void()> job) {
+			std::unique_lock<std::mutex> l(m_);
+			if (done_)
+				return;
+			queue_.push(std::move(job));
+			l.unlock();
+			cv_.notify_one();
+		}
+
+		std::function<void()> TaskQueue::pop_job() {
+			std::unique_lock<std::mutex> l(m_);
+			cv_.wait(l, [this] { return done_ || !queue_.empty(); });
+			if (done_)
+				return {};
+			std::function<void()> job(std::move(queue_.front()));
+			queue_.pop();
+			l.unlock();
+			return job;
+		}
+
+		void TaskQueue::done() {
+			std::unique_lock<std::mutex> l(m_);
+			if (done_)
+				return;
+			done_ = true;
+			l.unlock();
+			cv_.notify_one();
+		}
+
+		void TaskQueue::wait() {
+			if (thrd_.joinable())
+				thrd_.join();
+		}
+
+		TaskToken::TaskToken() = default;
+
+		TaskToken::~TaskToken() {
+			done();
+		}
+
+		void TaskToken::clean() {
+			{
+				std::lock_guard<std::mutex> l(m_);
+				status_ = Status::Clean;
+			}
+			cv_.notify_one();
+		}
+
+		void TaskToken::dirty() {
+			{
+				std::lock_guard<std::mutex> l(m_);
+				status_ = Status::Dirty;
+			}
+			cv_.notify_one();
+		}
+
+		void TaskToken::done() {
+			{
+				std::lock_guard<std::mutex> l(m_);
+				status_ = Status::Done;
+			}
+			cv_.notify_one();
+		}
+
+		TaskToken::Status TaskToken::wait_while_dirty() {
+			std::unique_lock<std::mutex> l(m_);
+			cv_.wait(l, [this] { return status_ != Status::Dirty; });
+			return status_;
+		}
+
+		TaskToken::Status TaskToken::wait_while_dirty(std::chrono::milliseconds timeout) {
+			std::unique_lock<std::mutex> l(m_);
+			cv_.wait_for(l, timeout, [this] { return status_ != Status::Dirty; });
+			return status_;
+		}
+
+	} // namespace details
 
 	std::string SafeMidiOutput::name() const
 	{

@@ -8,8 +8,12 @@
 
 #include "JuceHeader.h"
 
+#include <condition_variable>
+#include <future>
 #include <map>
+#include <queue>
 #include <set>
+#include <thread>
 
 #include "DebounceTimer.h"
 
@@ -20,6 +24,48 @@ namespace midikraft {
 
 	typedef std::function<void(MidiInput *source, MidiMessage const &message)> MidiCallback;
 
+	namespace details {
+		struct TaskQueue
+		{
+			std::thread thrd_;
+			std::mutex m_;
+			std::condition_variable cv_;
+			bool done_ = false;
+			std::queue<std::function<void()>> queue_;
+
+			TaskQueue();
+			~TaskQueue();
+
+			void run();
+
+			void push_job(std::function<void()> job);
+			std::function<void()> pop_job();
+
+			void done();
+			void wait();
+		};
+		struct TaskToken
+		{
+			enum class Status {
+				Clean,
+				Dirty,
+				Done
+			};
+			std::mutex m_;
+			std::condition_variable cv_;
+			Status status_ = Status::Done;
+
+			TaskToken();
+			~TaskToken();
+
+			void clean();
+			void dirty();
+			void done();
+			Status wait_while_dirty();
+			Status wait_while_dirty(std::chrono::milliseconds timeout);
+		};
+	} // namespace details
+
 	class SafeMidiOutput {
 	public:
 		SafeMidiOutput(MidiController *controller, MidiOutput *midiOutput);
@@ -28,7 +74,10 @@ namespace midikraft {
 		void sendMessageDebounced(const MidiMessage &message, int milliseconds);
 		void sendBlockOfMessagesFullSpeed(const MidiBuffer& buffer);
 		void sendBlockOfMessagesFullSpeed(const std::vector<MidiMessage>& buffer);
-		void sendBlockOfMessagesThrottled(const std::vector<MidiMessage>& buffer, int millisecondsWait);
+		std::future<void> sendBlockOfMessagesThrottled(const std::vector<MidiMessage>& buffer, int millisecondsWait);
+		std::future<void> sendBlockOfMessagesThrottled(const std::vector<MidiMessage>& buffer);
+		void releaseCurrentThrottledMessagesBlock();
+		void cancelCurrentThrottledMessagesBlock();
 
 		std::string name() const;
 		bool isValid() const;
@@ -37,6 +86,8 @@ namespace midikraft {
 		MidiOutput * midiOut_;
 		MidiController *controller_;
 		DebounceTimer debouncer_;
+		details::TaskQueue queue_;
+		details::TaskToken token_;
 	};
 
 	// TODO - another example of bad naming. This is rather the "MidiDeviceManager"
